@@ -45,7 +45,38 @@ function srtToVtt(s){const normalized=s.replace(/^\uFEFF/,'').replace(/\r\n?/g,'
 function renderSubtitle(v){const player=$('directPlayer');player.querySelectorAll('track').forEach(t=>t.remove());if(subtitleBlobUrl){URL.revokeObjectURL(subtitleBlobUrl);subtitleBlobUrl=null;}if(!v)return;let url;if(v.key){if(!mediaConfig.workerUrl)return;url=`${mediaConfig.workerUrl.replace(/\/$/,'')}/media/${encodeURIComponent(v.key)}`;}else if(v.url){try{url=validHttps(v.url);}catch{return;}}else return;
  // Browser track loading requires CORS from the media origin.
  const track=document.createElement('track');track.kind='subtitles';track.label=v.label||'Subtitles';track.srclang=v.lang||'en';track.src=url;track.default=true;player.append(track);track.addEventListener('load',()=>{track.track.mode='showing';});}
-async function uploadToWorker(file){const base=mediaConfig.workerUrl?.replace(/\/$/,'');if(!base)throw Error('Set workerUrl in media-config.js first.');const secret=$('uploadSecret').value;if(!secret)throw Error('Enter the Worker upload password.');if(file.size>90*1024*1024)throw Error('Browser upload limit is 90 MiB for this implementation. Use Wrangler CLI for larger files; see README.');const key=`${crypto.randomUUID()}/${file.name.replace(/[^a-zA-Z0-9._-]/g,'_')}`;const res=await fetch(`${base}/upload/${encodeURIComponent(key)}`,{method:'PUT',headers:{'Authorization':`Bearer ${secret}`,'Content-Type':file.type||'application/octet-stream'},body:file});if(!res.ok)throw Error('Upload failed: '+res.status+' '+(await res.text()).slice(0,150));return key;}
+const MULTIPART_CHUNK=8*1024*1024;
+async function uploadToWorker(file){
+ const base=mediaConfig.workerUrl?.replace(/\/$/,'');if(!base)throw Error('Set workerUrl in media-config.js first.');
+ const secret=$('uploadSecret').value;if(!secret)throw Error('Enter the Worker upload password.');
+ if(!file.size||file.size>5*1024**3)throw Error('Choose a nonempty file no larger than 5 GiB.');
+ const key=`${crypto.randomUUID()}/${file.name.replace(/[^a-zA-Z0-9._-]/g,'_').slice(0,180)||'movie.bin'}`;
+ const auth={'Authorization':`Bearer ${secret}`};
+ const check=async res=>{if(!res.ok)throw Error('Upload failed: '+res.status+' '+(await res.text()).slice(0,180));return res.json();};
+ const progress=$('uploadProgress');progress.value=0;show('uploadProgress',true);
+ if(file.size<=90*1024*1024){
+  const res=await fetch(`${base}/upload/${encodeURIComponent(key)}`,{method:'PUT',headers:{...auth,'Content-Type':file.type||'application/octet-stream'},body:file});await check(res);progress.value=100;return key;
+ }
+ const init=await check(await fetch(`${base}/multipart/init`,{method:'POST',headers:{...auth,'Content-Type':'application/json'},body:JSON.stringify({key,size:file.size,contentType:file.type||'application/octet-stream'})}));
+ const query=`key=${encodeURIComponent(key)}&uploadId=${encodeURIComponent(init.uploadId)}`;
+ const parts=[];const count=Math.ceil(file.size/MULTIPART_CHUNK);
+ try{
+  for(let i=0;i<count;i++){
+   const chunk=file.slice(i*MULTIPART_CHUNK,Math.min((i+1)*MULTIPART_CHUNK,file.size));
+   let part,err;
+   for(let attempt=0;attempt<3;attempt++){
+    try{part=await check(await fetch(`${base}/multipart/part?${query}&partNumber=${i+1}`,{method:'PUT',headers:{...auth,'Content-Type':'application/octet-stream'},body:chunk}));break;}
+    catch(e){err=e;if(attempt<2)await new Promise(r=>setTimeout(r,800*(attempt+1)));}
+   }
+   if(!part)throw err;
+   parts.push(part);progress.value=Math.round((i+1)/count*100);
+   $('uploadStatus').textContent=`Uploading part ${i+1} of ${count} (${progress.value}%)`;
+  }
+  $('uploadStatus').textContent='Finalizing movie in R2…';
+  await check(await fetch(`${base}/multipart/complete?${query}`,{method:'POST',headers:{...auth,'Content-Type':'application/json'},body:JSON.stringify({parts})}));
+  progress.value=100;return key;
+ }catch(e){await fetch(`${base}/multipart/abort?${query}`,{method:'POST',headers:auth}).catch(()=>{});throw e;}
+}
 $('uploadR2').onclick=async()=>{error('videoError','');const file=$('r2File').files[0];if(!file){error('videoError','Select a file first.');return;}$('uploadR2').disabled=true;$('uploadStatus').textContent='Uploading… (large files can take time)';try{const key=await uploadToWorker(file);await set(ref(db,`rooms/${roomId}/video`),{mode:'r2',key,filename:file.name,updatedAt:serverTimestamp()});$('uploadStatus').textContent='Uploaded. Friends can play now.';}catch(e){error('videoError',e.message);$('uploadStatus').textContent='Upload not completed.';}finally{$('uploadR2').disabled=uid!==hostId;}};
 $('setDirect').onclick=async()=>{try{error('videoError','');const url=validHttps($('directUrl').value);await set(ref(db,`rooms/${roomId}/video`),{mode:'url',url,filename:new URL(url).pathname,updatedAt:serverTimestamp()});}catch(e){error('videoError',e.message);}};
 $('setSubtitle').onclick=async()=>{try{error('videoError','');const file=$('subtitleFile').files[0];if(file){if(file.size>2*1024*1024)throw Error('Subtitle file too large (2 MiB max).');let contents=await file.text();if(/\.srt$/i.test(file.name))contents=srtToVtt(contents);else if(!contents.trimStart().startsWith('WEBVTT'))throw Error('Select an SRT or VTT file.');const blob=new File([contents],file.name.replace(/\.srt$/i,'.vtt'),{type:'text/vtt'});const key=await uploadToWorker(blob);await set(ref(db,`rooms/${roomId}/subtitle`),{key,label:file.name,lang:'en'});}else{const url=validHttps($('subtitleUrl').value);if(!/\.vtt(?:$|[?#])/i.test(url))throw Error('External subtitle URL must be WebVTT (.vtt).');await set(ref(db,`rooms/${roomId}/subtitle`),{url,label:'Subtitles',lang:'en'});}}catch(e){error('videoError',e.message);}};
