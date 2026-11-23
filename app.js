@@ -12,7 +12,7 @@ function driveId(url){try{const u=new URL(url);if(!['drive.google.com','docs.goo
 function saveName(){displayName=$('displayName').value.trim().slice(0,30)||localStorage.getItem('watchroom-name')||'Guest';localStorage.setItem('watchroom-name',displayName);}
 function setStatus(msg){$('connection').textContent='● '+msg;}
 async function init(){if(!config||!config.apiKey||config.apiKey==='REPLACE_ME'){error('setupError','Fill in config.js to enable the app.');return;}try{const app=initializeApp(config);auth=getAuth(app);db=getDatabase(app);await signInAnonymously(auth);uid=auth.currentUser.uid;show('setup',false);show('lobby',true);setStatus('Connected');$('displayName').value=localStorage.getItem('watchroom-name')||'';const id=new URLSearchParams(location.search).get('room');if(id){if(!/^[a-f0-9]{36}$/.test(id))throw Error('Invalid room link');await joinRoom(id);} }catch(e){error('setupError','Firebase setup or connection failed: '+e.message);error('lobbyError',e.message);setStatus('Connection error');}}
-async function joinRoom(id){saveName();const snap=await get(ref(db,`rooms/${id}/meta`));if(!snap.exists())throw Error('Room not found or expired.');roomId=id;hostId=snap.val().hostId;const presence=ref(db,`rooms/${id}/participants/${uid}`);await onDisconnect(presence).remove();await set(presence,{name:displayName,joinedAt:serverTimestamp()});show('lobby',false);show('room',true);$('roomShort').textContent='#'+id.slice(0,6);for(const id of ['setVideo','driveUrl','sourceMode','r2File','uploadSecret','uploadR2','directUrl','setDirect','subtitleFile','subtitleUrl','setSubtitle','clearSubtitle'])$(id).disabled=uid!==hostId;$('videoNote').textContent=uid===hostId?'You are the host. Select a media source.':'Only the host can change the media.';
+async function joinRoom(id){saveName();const snap=await get(ref(db,`rooms/${id}/meta`));if(!snap.exists())throw Error('Room not found or expired.');roomId=id;hostId=snap.val().hostId;const presence=ref(db,`rooms/${id}/participants/${uid}`);await onDisconnect(presence).remove();await set(presence,{name:displayName,joinedAt:serverTimestamp()});show('lobby',false);show('room',true);$('roomShort').textContent='#'+id.slice(0,6);for(const id of ['setVideo','driveUrl','sourceMode','r2File','uploadSecret','retentionHours','uploadR2','directUrl','setDirect','subtitleFile','subtitleUrl','setSubtitle','clearSubtitle'])$(id).disabled=uid!==hostId;$('videoNote').textContent=uid===hostId?'You are the host. Select a media source.':'Only the host can change the media.';
  off.push(onValue(ref(db,`rooms/${id}/video`),s=>renderMedia(s.val()).catch(e=>error('videoError',e.message))));
  off.push(onValue(ref(db,`rooms/${id}/subtitle`),s=>renderSubtitle(s.val())));
  off.push(onValue(ref(db,`rooms/${id}/participants`),s=>{participants=s.val()||{};const list=$('people');list.replaceChildren();Object.entries(participants).forEach(([id,p])=>{const li=document.createElement('li'),dot=document.createElement('span');dot.className='dot';li.append(dot,document.createTextNode((p.name||'Guest')+(id===hostId?' (host)':'')+(id===uid?' (you)':'')));list.append(li);});$('count').textContent=Object.keys(participants).length;if(voiceStream)syncPeers();}));
@@ -51,13 +51,15 @@ async function uploadToWorker(file){
  const secret=$('uploadSecret').value;if(!secret)throw Error('Enter the Worker upload password.');
  if(!file.size||file.size>5*1024**3)throw Error('Choose a nonempty file no larger than 5 GiB.');
  const key=`${crypto.randomUUID()}/${file.name.replace(/[^a-zA-Z0-9._-]/g,'_').slice(0,180)||'movie.bin'}`;
- const auth={'Authorization':`Bearer ${secret}`};
+ const hours=Number($('retentionHours').value);
+  if(![6,12,24,168,336,504,672].includes(hours))throw Error('Choose a valid retention period.');
+  const auth={'Authorization':`Bearer ${secret}`};
  const check=async res=>{if(!res.ok)throw Error('Upload failed: '+res.status+' '+(await res.text()).slice(0,180));return res.json();};
  const progress=$('uploadProgress');progress.value=0;show('uploadProgress',true);
  if(file.size<=90*1024*1024){
-  const res=await fetch(`${base}/upload/${encodeURIComponent(key)}`,{method:'PUT',headers:{...auth,'Content-Type':file.type||'application/octet-stream'},body:file});await check(res);progress.value=100;return key;
+  const res=await fetch(`${base}/upload/${encodeURIComponent(key)}`,{method:'PUT',headers:{...auth,'Content-Type':file.type||'application/octet-stream','X-Watchroom-Retention-Hours':String(hours)},body:file});await check(res);progress.value=100;return key;
  }
- const init=await check(await fetch(`${base}/multipart/init`,{method:'POST',headers:{...auth,'Content-Type':'application/json'},body:JSON.stringify({key,size:file.size,contentType:file.type||'application/octet-stream'})}));
+ const init=await check(await fetch(`${base}/multipart/init`,{method:'POST',headers:{...auth,'Content-Type':'application/json'},body:JSON.stringify({key,size:file.size,contentType:file.type||'application/octet-stream',retentionHours:hours})}));
  const query=`key=${encodeURIComponent(key)}&uploadId=${encodeURIComponent(init.uploadId)}`;
  const parts=[];const count=Math.ceil(file.size/MULTIPART_CHUNK);
  try{
