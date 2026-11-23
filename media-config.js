@@ -1,3 +1,3 @@
 window.WATCHROOM_MEDIA_CONFIG = {
-  workerUrl: "https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev"
+  workerUrl: "https://watchroom-v2-media.watchroom-v2.workers.dev"
 };
