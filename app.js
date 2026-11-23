@@ -3,7 +3,7 @@ import {getAuth,signInAnonymously,onAuthStateChanged} from 'https://www.gstatic.
 import {getDatabase,ref,set,get,push,onValue,onChildAdded,remove,onDisconnect,serverTimestamp,limitToLast,query,update} from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-database.js';
 const $=id=>document.getElementById(id);const config=window.WATCHROOM_FIREBASE_CONFIG;
 let auth,db,uid,roomId,hostId,displayName,participants={},off=[],voiceStream=null,muted=false;
-let activeMediaKey=null, playbackState=null, mediaLoading=false, lastHostPublish=0, syncTimer=null, syncOptOut=false;
+let activeMediaKey=null, playbackState=null, mediaLoading=false, lastHostPublish=0, syncTimer=null, syncOptOut=false, guestLocalPaused=false, syncActionDepth=0;
 const mediaConfig=window.WATCHROOM_MEDIA_CONFIG||{};let subtitleBlobUrl=null;
 const peers=new Map(),remoteAudio=new Map(),processedSignals=new Set();
 const show=(id,yes)=>$(id).classList.toggle('hidden',!yes);
@@ -32,7 +32,7 @@ async function syncPeers(){if(!voiceStream)return;for(const id of Object.keys(pa
 async function joinVoice(){try{voiceStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});$('joinVoice').disabled=true;$('muteVoice').disabled=false;$('leaveVoice').disabled=false;$('voiceStatus').textContent='Voice connected';for(const id of Object.keys(participants))if(id!==uid)await sendSignal(id,{type:'voice-ready'});}catch(e){$('voiceStatus').textContent='Mic unavailable: '+e.message;}}
 function closePeer(id){peers.get(id)?.close();peers.delete(id);remoteAudio.get(id)?.remove();remoteAudio.delete(id);}
 async function leaveVoice(){for(const id of peers.keys())sendSignal(id,{type:'bye'}).catch(()=>{});for(const id of [...peers.keys()])closePeer(id);voiceStream?.getTracks().forEach(t=>t.stop());voiceStream=null;muted=false;$('joinVoice').disabled=false;$('muteVoice').disabled=true;$('muteVoice').textContent='Mute mic';$('leaveVoice').disabled=true;$('voiceStatus').textContent='Voice disconnected';}
-async function leaveRoom(){if(syncTimer){clearInterval(syncTimer);syncTimer=null;}activeMediaKey=null;playbackState=null;syncOptOut=false;await leaveVoice();off.forEach(f=>f());off=[];if(roomId){await remove(ref(db,`rooms/${roomId}/participants/${uid}`)).catch(()=>{});}roomId=null;participants={};processedSignals.clear();$('messages').replaceChildren();show('room',false);show('lobby',true);history.replaceState(null,'',location.pathname);}
+async function leaveRoom(){if(syncTimer){clearInterval(syncTimer);syncTimer=null;}activeMediaKey=null;playbackState=null;syncOptOut=false;guestLocalPaused=false;await leaveVoice();off.forEach(f=>f());off=[];if(roomId){await remove(ref(db,`rooms/${roomId}/participants/${uid}`)).catch(()=>{});}roomId=null;participants={};processedSignals.clear();$('messages').replaceChildren();show('room',false);show('lobby',true);history.replaceState(null,'',location.pathname);}
 $('createRoom').onclick=createRoom;$('setVideo').onclick=loadVideo;$('copyInvite').onclick=async()=>{try{await navigator.clipboard.writeText(location.href);$('copyInvite').textContent='Copied!';setTimeout(()=>$('copyInvite').textContent='Copy invite link',1800);}catch{prompt('Copy this link:',location.href)}};$('leaveRoom').onclick=leaveRoom;
 $('chatForm').onsubmit=async e=>{e.preventDefault();const input=$('messageInput'),msg=input.value.trim();if(!msg||!roomId)return;input.value='';try{await push(ref(db,`rooms/${roomId}/messages`),{name:displayName,text:msg.slice(0,1000),at:Date.now(),sender:uid});}catch(err){input.value=msg;alert('Message not sent: '+err.message);}};
 $('joinVoice').onclick=joinVoice;$('leaveVoice').onclick=leaveVoice;$('muteVoice').onclick=()=>{muted=!muted;voiceStream?.getAudioTracks().forEach(t=>t.enabled=!muted);$('muteVoice').textContent=muted?'Unmute mic':'Mute mic';};
@@ -42,9 +42,37 @@ function validHttps(raw){try{const u=new URL(raw);if(u.protocol!=='https:'||u.us
 function mediaIdentity(v){return v&&(v.mode==='r2'?`r2:${v.key}`:v.mode==='url'?`url:${v.url}`:null);}
 function activePlayer(){return !$('directPlayer').classList.contains('hidden')?$('directPlayer'):!$('audioPlayer').classList.contains('hidden')?$('audioPlayer'):null;}
 function syncLabel(message){const el=$('syncStatus');if(el)el.textContent=message;}
-function updateJoinButton(visible){const btn=$('joinPlayback');if(btn){show('joinPlayback',visible&&uid!==hostId&&!!activeMediaKey);btn.textContent=syncOptOut?'Rejoin synchronization':'Join synchronized playback';}const cancel=$('cancelPlaybackSync');if(cancel)show('cancelPlaybackSync',uid!==hostId&&!!activeMediaKey&&!syncOptOut);}
-function cancelPlaybackSync(){syncOptOut=true;syncLabel('');updateJoinButton(true);}
+function updateLocalPauseButton(){
+ const btn=$('localPausePlayback');if(!btn)return;
+ const available=uid!==hostId&&!!activeMediaKey&&!syncOptOut;
+ show('localPausePlayback',available);
+ btn.textContent=guestLocalPaused?'Resume with host':'Pause for me';
+ btn.setAttribute('aria-pressed',String(guestLocalPaused));
+}
+function updateJoinButton(visible){
+ const btn=$('joinPlayback');if(btn){show('joinPlayback',visible&&uid!==hostId&&!!activeMediaKey);btn.textContent=syncOptOut?'Rejoin synchronization':'Join synchronized playback';}
+ const cancel=$('cancelPlaybackSync');if(cancel)show('cancelPlaybackSync',uid!==hostId&&!!activeMediaKey&&!syncOptOut);
+ updateLocalPauseButton();
+}
+// Suppress events caused by synchronization itself, not by the viewer pressing native controls.
+function syncedPlayerAction(action){
+ syncActionDepth++;
+ try{return action();}finally{setTimeout(()=>{syncActionDepth=Math.max(0,syncActionDepth-1);},0);}
+}
+function localPause(){
+ if(uid===hostId||syncOptOut||!activeMediaKey)return;
+ guestLocalPaused=true;
+ const player=activePlayer();if(player&&!player.paused)syncedPlayerAction(()=>player.pause());
+ syncLabel('Paused for you — host keeps playing');updateJoinButton(false);
+}
+function resumeWithHost(){
+ if(uid===hostId||syncOptOut||!activeMediaKey)return;
+ guestLocalPaused=false;updateJoinButton(false);
+ syncLabel('Rejoining host playback…');applyPlaybackSync();
+}
+function cancelPlaybackSync(){syncOptOut=true;guestLocalPaused=false;syncLabel('Sync off — independent playback');updateJoinButton(true);}
 $('cancelPlaybackSync').addEventListener('click',cancelPlaybackSync);
+$('localPausePlayback').addEventListener('click',()=>guestLocalPaused?resumeWithHost():localPause());
 function targetPosition(state){return Math.max(0,Number(state.position)||0)+(state.playing?Math.max(0,(Date.now()-Number(state.updatedAt||Date.now()))/1000):0);}
 async function publishPlayback(){
  if(uid!==hostId||!roomId||!activeMediaKey||mediaLoading)return;
@@ -54,31 +82,37 @@ async function publishPlayback(){
 }
 function applyPlaybackSync(){
  if(!roomId||uid===hostId||!activeMediaKey||syncOptOut)return;
+ if(guestLocalPaused){syncLabel('Paused for you — host keeps playing');return;}
  const player=activePlayer(),state=playbackState;
  if(!player||!state||state.mediaKey!==activeMediaKey||player.readyState===0)return;
  let target=targetPosition(state);
  if(Number.isFinite(player.duration))target=Math.min(target,Math.max(0,player.duration-0.15));
  if(Math.abs(player.currentTime-target)>(state.playing?1.5:0.3)){
-  try{player.currentTime=target;}catch(e){console.warn('Sync seek delayed',e);}
+  try{syncedPlayerAction(()=>{player.currentTime=target;});}catch(e){console.warn('Sync seek delayed',e);}
  }
  if(state.playing){
-  if(player.paused)player.play().then(()=>{syncLabel('Synchronized with host');updateJoinButton(false);}).catch(()=>{syncLabel('Tap Join synchronized playback to start');updateJoinButton(true);});
+  if(player.paused)syncedPlayerAction(()=>player.play()).then(()=>{if(!guestLocalPaused){syncLabel('Synchronized with host');updateJoinButton(false);}}).catch(()=>{if(!guestLocalPaused){syncLabel('Tap Join synchronized playback to start');updateJoinButton(true);}});
   else syncLabel('Synchronized with host');
- }else{if(!player.paused)player.pause();syncLabel('Host paused playback');updateJoinButton(false);}
+ }else{if(!player.paused)syncedPlayerAction(()=>player.pause());syncLabel('Host paused playback');updateJoinButton(false);}
 }
 for(const player of [$('directPlayer'),$('audioPlayer')]){
  player.addEventListener('loadedmetadata',()=>{if(uid===hostId){mediaLoading=false;}else applyPlaybackSync();});
- for(const eventName of ['play','pause','seeked'])player.addEventListener(eventName,()=>{if(uid===hostId&&!mediaLoading)publishPlayback();});
+ for(const eventName of ['play','pause','seeked'])player.addEventListener(eventName,()=>{
+  if(uid===hostId){if(!mediaLoading)publishPlayback();return;}
+  if(!roomId||!activeMediaKey||syncOptOut||syncActionDepth)return;
+  if(eventName==='pause'&&playbackState?.playing&&!guestLocalPaused){localPause();}
+  if(eventName==='play'&&guestLocalPaused){resumeWithHost();}
+ });
  player.addEventListener('timeupdate',()=>{if(uid===hostId&&!mediaLoading&&!player.paused&&Date.now()-lastHostPublish>5000){lastHostPublish=Date.now();publishPlayback();}});
 }
 $('joinPlayback').addEventListener('click',async()=>{
- syncOptOut=false;updateJoinButton(false);
+ syncOptOut=false;guestLocalPaused=false;updateJoinButton(false);
  const player=activePlayer();if(!player)return;
- try{await player.play();applyPlaybackSync();if(playbackState&&!playbackState.playing)player.pause();updateJoinButton(false);}catch(e){syncLabel('Playback blocked: '+e.message);}
+ try{await syncedPlayerAction(()=>player.play());applyPlaybackSync();if(playbackState&&!playbackState.playing)syncedPlayerAction(()=>player.pause());updateJoinButton(false);}catch(e){syncLabel('Playback blocked: '+e.message);}
 });
 function modeChange(){const m=$('sourceMode').value;show('r2Fields',m==='r2');show('driveFields',m==='drive');show('urlFields',m==='url');}
 $('sourceMode').addEventListener('change',modeChange);
-async function renderMedia(v){const nextKey=mediaIdentity(v);if(nextKey!==activeMediaKey){syncOptOut=false;activeMediaKey=nextKey;mediaLoading=!!nextKey;syncLabel(nextKey?(uid===hostId?'Host controls playback':'Waiting for host playback…'):'');updateJoinButton(false);}
+async function renderMedia(v){const nextKey=mediaIdentity(v);if(nextKey!==activeMediaKey){syncOptOut=false;guestLocalPaused=false;activeMediaKey=nextKey;mediaLoading=!!nextKey;syncLabel(nextKey?(uid===hostId?'Host controls playback':'Waiting for host playback…'):'');updateJoinButton(false);}
  const frame=$('videoFrame'),video=$('directPlayer'),audio=$('audioPlayer');frame.removeAttribute('src');video.pause();audio.pause();video.removeAttribute('src');audio.removeAttribute('src');video.load();audio.load();frame.style.display='none';show('directPlayer',false);show('audioPlayer',false);show('emptyPlayer',!v);if(!v)return;
  if(v.mode==='drive'||(!v.mode&&v.fileId)){frame.src=`https://drive.google.com/file/d/${encodeURIComponent(v.fileId)}/preview`;frame.style.display='block';show('emptyPlayer',false);return;}
  if(v.mode==='r2'||v.mode==='url'){let url=v.mode==='r2'?`${mediaConfig.workerUrl?.replace(/\/$/,'')}/media/${encodeURIComponent(v.key)}`:validHttps(v.url);if(!url||url.startsWith('undefined'))throw Error('Configure media-config.js with the R2 Worker URL.');const isAudio=/\.(mp3|m4a|ogg|wav|flac)(?:$|[?#])/i.test(v.filename||v.url||'');const player=isAudio?audio:video;player.src=url;show(isAudio?'audioPlayer':'directPlayer',true);show('emptyPlayer',false);player.controls=true;player.load();if(uid!==hostId){updateJoinButton(true);}if(!syncTimer){syncTimer=setInterval(applyPlaybackSync,4000);}return;}}
